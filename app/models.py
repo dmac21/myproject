@@ -5,6 +5,8 @@ from itsdangerous import TimedJSONWebSignatureSerializer as Serializer
 from flask import current_app,request
 from datetime import datetime
 import hashlib
+import bleach
+from markdown import markdown
 
 class Permission:
     Follow=0x01
@@ -17,12 +19,43 @@ class Permission:
 def load_user(user_id):
     return User.query.get(int(user_id))
 
+
+class Follow(db.Model):
+    __tablename__='follows'
+    follower_id=db.Column(db.Integer,db.ForeignKey('users.id'),primary_key=True)
+    followed_id=db.Column(db.Integer,db.ForeignKey('users.id'),primary_key=True)
+    timestamp=db.Column(db.DateTime,default=datetime.utcnow)
+
+
 class Post(db.Model):
     __tablename__='posts'
     id=db.Column(db.Integer,primary_key=True)
     body=db.Column(db.Text)
     timestamp=db.Column(db.DateTime,index=True,default=datetime.utcnow)
     author_id=db.Column(db.Integer,db.ForeignKey('users.id'))
+    body_html=db.Column(db.Text)
+
+    @staticmethod
+    def on_changed_body(target,value,oldvalue,initiator):
+        allowed_tags=['a','abbr','acronym','b','blockquote','code','em','i','li','ol','pre','strong','ul','h1','h2','h3','p']
+        target.body_html=bleach.linkify(bleach.clean(markdown(value,output_format='html'),tags=allowed_tags,strip=True))
+
+    @staticmethod
+    def generate_fake(count=100):
+        from random import seed,randint
+        import forgery_py
+
+        seed()
+        user_count=User.query.count()
+        for i in range(count):
+            u=User.query.offset(randint(0,user_count-1)).first()
+            p=Post(body=forgery_py.lorem_ipsum.sentences(randint(1,3)),
+                   timestamp=forgery_py.date.date(True),
+                   author=u)
+            db.session.add(p)
+            db.session.commit()
+
+db.event.listen(Post.body,'set',Post.on_changed_body)
 
 class Role(db.Model):
     __tablename__='roles'
@@ -74,6 +107,58 @@ class User(UserMixin, db.Model):
     last_seen=db.Column(db.DateTime(),default=datetime.utcnow)
     confirmed=db.Column(db.Boolean,default=False)
     avatar_hash = db.Column(db.String(32))
+
+    followed = db.relationship('Follow',
+                               foreign_keys=[Follow.follower_id],
+                               backref=db.backref('follower', lazy='joined'),
+                               lazy='dynamic',
+                               cascade='all, delete-orphan')
+    followers = db.relationship('Follow',
+                                foreign_keys=[Follow.followed_id],
+                                backref=db.backref('followed', lazy='joined'),
+                                lazy='dynamic',
+                                cascade='all, delete-orphan')
+
+    @staticmethod
+    def generate_fake(count=100):
+        from sqlalchemy.exc import IntegrityError
+        from random import seed
+        import forgery_py
+
+        seed()
+        for i in range(count):
+            u=User(email=forgery_py.internet.email_address(),
+                   username=forgery_py.internet.user_name(True),
+                   password=forgery_py.lorem_ipsum.word(),
+                   confirmed=True,
+                   name=forgery_py.name.full_name(),
+                   location=forgery_py.address.city(),
+                   about_me=forgery_py.lorem_ipsum.sentence(),
+                   member_since=forgery_py.date.date(True))
+            db.session.add(u)
+            try:
+                db.session.commit()
+            except IntegrityError:
+                db.session.rollback()
+
+    def follow(self, user):
+        if not self.is_following(user):
+            f = Follow(follower=self, followed=user)
+            db.session.add(f)
+
+    def unfollow(self, user):
+        f = self.followed.filter_by(followed_id=user.id).first()
+        if f:
+            db.session.delete(f)
+
+    def is_following(self, user):
+        return self.followed.filter_by(
+            followed_id=user.id).first() is not None
+
+    def is_followed_by(self, user):
+        return self.followers.filter_by(
+            follower_id=user.id).first() is not None
+
 
     def ping(self):
         self.last_seen=datetime.utcnow()
